@@ -167,7 +167,7 @@ def task2(ti):
     logger.info(f"Starting Task_2 - DAG: {ti.dag_id}, Run: {ti.run_id}")
 
     context_carrier = ti.context_carrier
-
+    
     # DIAGNOSTIC
     if context_carrier is None:
         logger.error("❌ NO CONTEXT CARRIER in task2!")
@@ -179,25 +179,27 @@ def task2(ti):
     instrument_requests(otel_tracer_provider)
 
     with task_root_span(ti, otel_task_tracer, otel_tracer_provider):
-        # Properly inject trace context into headers
-        headers = {}
-
-        # RequestsInstrumentor should do this automatically, but be explicit
-        from opentelemetry.propagate import inject
-        inject(headers)  # Adds traceparent header from current context
-
-        logger.info(f"Injected headers: {headers}")
-
+        # Option 1: Let RequestsInstrumentor handle it automatically
+        # Since you've instrumented requests, it should auto-inject trace context
         res = requests.get(
             "https://monitorama-demo-test.wallace.network/space_json/",
-            headers=headers,
             timeout=25
         )
+        
+        # Option 2: If auto-instrumentation isn't working, manually inject
+        # headers = context_carrier if context_carrier else {}
+        # from opentelemetry.propagate import inject
+        # inject(headers)  # Adds current span context
+        # res = requests.get(
+        #     "https://monitorama-demo-test.wallace.network/space_json/",
+        #     headers=headers,
+        #     timeout=25
+        # )
 
         logger.info(f"\n\tStatus: {res.status_code}\n\tBody: {res.text[:200]}")
-
+    
     logger.info("Task_2 finished")
-
+    logger.info("=" * 80)
 
 @dag(
     schedule=timedelta(seconds=30),
