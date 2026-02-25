@@ -139,7 +139,7 @@ def task1(ti):
                     # tracer.start_as_current_span(name="")
                     with otel_task_tracer.start_child_span(span_name="get_repos_auto_instrumentation") as auto_instr_s:
                         # Some remote request.
-                        response = requests.get("https://api.github.com/users/xBis7/repos")
+                        response = requests.get("https://jsonplaceholder.typicode.com/todos/1")
                         logger.info("Response: %s", response.json())
 
                         auto_instr_s.set_attribute("test.repos_response", pformat(response.json()))
