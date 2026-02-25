@@ -23,6 +23,7 @@ import pendulum
 
 import requests
 
+from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from opentelemetry import trace
 
 from airflow.sdk import chain, dag, task
@@ -32,6 +33,15 @@ from airflow.traces.tracer import Trace
 from pprint import pformat
 
 logger = logging.getLogger("airflow.otel_test_dag")
+_REQUESTS_INSTRUMENTED = False
+
+
+def instrument_requests(otel_tracer_provider):
+    global _REQUESTS_INSTRUMENTED
+    if _REQUESTS_INSTRUMENTED:
+        return
+    RequestsInstrumentor().instrument(tracer_provider=otel_tracer_provider)
+    _REQUESTS_INSTRUMENTED = True
 
 @task
 def task1(ti):
@@ -68,8 +78,7 @@ def task1(ti):
 
                 # To use library instrumentation we have to hook up the tracer_provider.
                 # The instrumentation library must already be installed.
-                from opentelemetry.instrumentation.requests import RequestsInstrumentor
-                RequestsInstrumentor().instrument(tracer_provider=otel_tracer_provider)
+                instrument_requests(otel_tracer_provider)
 
                 # If we don't set the parent context, it will get it like so
                 # trace.get_current_span().get_span_context()
@@ -110,8 +119,7 @@ def task2(ti):
     # Ensure the outgoing HTTP request is emitted as a client span in this task process.
     otel_task_tracer = otel_tracer.get_otel_tracer_for_task(Trace)
     otel_tracer_provider = otel_task_tracer.get_otel_tracer_provider()
-    from opentelemetry.instrumentation.requests import RequestsInstrumentor
-    RequestsInstrumentor().instrument(tracer_provider=otel_tracer_provider)
+    instrument_requests(otel_tracer_provider)
 
     # Some remote request with the context injected into the headers.
     res = requests.get("https://monitorama-demo-test.wallace.network/space_json/", headers=context_carrier, timeout=25)
