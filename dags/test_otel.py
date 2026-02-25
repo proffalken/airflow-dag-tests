@@ -50,34 +50,65 @@ def instrument_requests(otel_tracer_provider):
 @contextmanager
 def task_root_span(ti, otel_task_tracer, otel_tracer_provider) -> Iterator:
     parent_context = None
+
+    # DIAGNOSTIC: Check if Airflow provided trace context
     if ti.context_carrier is not None:
+        logger.info(f"✓ Found context_carrier: {ti.context_carrier}")
         parent_context = otel_task_tracer.extract(ti.context_carrier)
+    else:
+        logger.error("❌ ti.context_carrier is None! DAG run did not create root span.")
+        logger.error("Check Airflow [traces] configuration: otel_on, otel_dag_run_log_event")
 
     tracer = trace.get_tracer("airflow.otel_test_dag", tracer_provider=otel_tracer_provider)
+
+    # Use INTERNAL kind for task execution
     with tracer.start_as_current_span(
-        f"{ti.task_id}.run",
+        f"dag.{ti.dag_id}.task.{ti.task_id}",
         context=parent_context,
-        kind=SpanKind.CONSUMER,
+        kind=SpanKind.INTERNAL,  # Changed from CONSUMER
     ) as span:
+        # Add standard attributes
         span.set_attribute("airflow.dag_id", ti.dag_id)
         span.set_attribute("airflow.task_id", ti.task_id)
         span.set_attribute("airflow.run_id", ti.run_id)
+
+        # DIAGNOSTIC: Verify trace ID was created
+        span_context = span.get_span_context()
+        if span_context.trace_id == 0:
+            logger.error("❌ CRITICAL: Span has trace_id = 0! OpenTelemetry not initialized!")
+        else:
+            trace_id = format(span_context.trace_id, '032x')
+            span_id = format(span_context.span_id, '016x')
+            logger.info(f"✓ Trace ID: {trace_id}")
+            logger.info(f"✓ Span ID: {span_id}")
+
         yield parent_context
 
 @task
 def task1(ti):
-    logger.info("Starting Task_1.")
-
+    logger.info("=" * 80)
+    logger.info(f"Starting Task_1 - DAG: {ti.dag_id}, Run: {ti.run_id}")
+    
     context_carrier = ti.context_carrier
+    
+    # CRITICAL DIAGNOSTIC
+    if context_carrier is None:
+        logger.error("❌ NO CONTEXT CARRIER - DAG tracing is broken!")
+    else:
+        logger.info(f"✓ Context carrier present: {context_carrier}")
 
-    # The difference between the task tracer and the one used for the dag, is the type of the SpanProcessor.
-    # The general tracer uses a BatchSpanProcessor, while the task tracer uses a SimpleSpanProcessor.
-    # If the `simple` isn't used, the dag might finish and the executing process will be cleaned up
-    # before there is a chance to export the spans, which means that they will be lost.
     otel_task_tracer = otel_tracer.get_otel_tracer_for_task(Trace)
     tracer_provider = otel_task_tracer.get_otel_tracer_provider()
 
     with task_root_span(ti, otel_task_tracer, tracer_provider) as parent_context:
+        # Verify current span
+        current_span = trace.get_current_span()
+        ctx = current_span.get_span_context()
+        
+        if ctx.trace_id != 0:
+            logger.info(f"✓ Active trace: {format(ctx.trace_id, '032x')}")
+        
+        # Your existing logic continues...
         if context_carrier is not None:
             logger.info("Found ti.context_carrier: %s.", context_carrier)
             logger.info("Extracting the span context from the context_carrier.")
@@ -132,23 +163,40 @@ def task1(ti):
 
 @task
 def task2(ti):
-    logger.info("Starting Task_2.")
+    logger.info("=" * 80)
+    logger.info(f"Starting Task_2 - DAG: {ti.dag_id}, Run: {ti.run_id}")
 
     context_carrier = ti.context_carrier
-    logger.info("Injected headers: " + str(context_carrier))
 
-    # Ensure the outgoing HTTP request is emitted as a client span in this task process.
+    # DIAGNOSTIC
+    if context_carrier is None:
+        logger.error("❌ NO CONTEXT CARRIER in task2!")
+    else:
+        logger.info(f"✓ Context carrier: {context_carrier}")
+
     otel_task_tracer = otel_tracer.get_otel_tracer_for_task(Trace)
     otel_tracer_provider = otel_task_tracer.get_otel_tracer_provider()
     instrument_requests(otel_tracer_provider)
 
     with task_root_span(ti, otel_task_tracer, otel_tracer_provider):
-        # Some remote request with the context injected into the headers.
-        res = requests.get("https://monitorama-demo-test.wallace.network/space_json/", headers=context_carrier, timeout=25)
+        # Properly inject trace context into headers
+        headers = {}
 
-        logger.info("\n\tStatus: " + str(res.status_code) + "\n\tBody: " + str(res.text))
-    
-    logger.info("Task_2 finished.")
+        # RequestsInstrumentor should do this automatically, but be explicit
+        from opentelemetry.propagate import inject
+        inject(headers)  # Adds traceparent header from current context
+
+        logger.info(f"Injected headers: {headers}")
+
+        res = requests.get(
+            "https://monitorama-demo-test.wallace.network/space_json/",
+            headers=headers,
+            timeout=25
+        )
+
+        logger.info(f"\n\tStatus: {res.status_code}\n\tBody: {res.text[:200]}")
+
+    logger.info("Task_2 finished")
 
 
 @dag(
