@@ -16,6 +16,7 @@
 # under the License.
 from __future__ import annotations
 
+from datetime import timedelta
 import logging
 
 import pendulum
@@ -115,7 +116,7 @@ def task2(ti):
 
 
 @dag(
-    schedule=None,
+    schedule=timedelta(seconds=30),
     start_date=pendulum.datetime(2025, 8, 30, tz="UTC"),
     catchup=False,
 )
