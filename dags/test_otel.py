@@ -107,6 +107,12 @@ def task2(ti):
     context_carrier = ti.context_carrier
     logger.info("Injected headers: " + str(context_carrier))
 
+    # Ensure the outgoing HTTP request is emitted as a client span in this task process.
+    otel_task_tracer = otel_tracer.get_otel_tracer_for_task(Trace)
+    otel_tracer_provider = otel_task_tracer.get_otel_tracer_provider()
+    from opentelemetry.instrumentation.requests import RequestsInstrumentor
+    RequestsInstrumentor().instrument(tracer_provider=otel_tracer_provider)
+
     # Some remote request with the context injected into the headers.
     res = requests.get("https://monitorama-demo-test.wallace.network/space_json/", headers=context_carrier, timeout=25)
 
