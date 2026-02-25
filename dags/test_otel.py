@@ -16,8 +16,10 @@
 # under the License.
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import timedelta
 import logging
+from typing import Iterator
 
 import pendulum
 
@@ -25,6 +27,7 @@ import requests
 
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from opentelemetry import trace
+from opentelemetry.trace import SpanKind
 
 from airflow.sdk import chain, dag, task
 from airflow.traces import otel_tracer
@@ -43,6 +46,24 @@ def instrument_requests(otel_tracer_provider):
     RequestsInstrumentor().instrument(tracer_provider=otel_tracer_provider)
     _REQUESTS_INSTRUMENTED = True
 
+
+@contextmanager
+def task_root_span(ti, otel_task_tracer, otel_tracer_provider) -> Iterator:
+    parent_context = None
+    if ti.context_carrier is not None:
+        parent_context = otel_task_tracer.extract(ti.context_carrier)
+
+    tracer = trace.get_tracer("airflow.otel_test_dag", tracer_provider=otel_tracer_provider)
+    with tracer.start_as_current_span(
+        f"{ti.task_id}.run",
+        context=parent_context,
+        kind=SpanKind.CONSUMER,
+    ) as span:
+        span.set_attribute("airflow.dag_id", ti.dag_id)
+        span.set_attribute("airflow.task_id", ti.task_id)
+        span.set_attribute("airflow.run_id", ti.run_id)
+        yield parent_context
+
 @task
 def task1(ti):
     logger.info("Starting Task_1.")
@@ -56,55 +77,55 @@ def task1(ti):
     otel_task_tracer = otel_tracer.get_otel_tracer_for_task(Trace)
     tracer_provider = otel_task_tracer.get_otel_tracer_provider()
 
-    if context_carrier is not None:
-        logger.info("Found ti.context_carrier: %s.", context_carrier)
-        logger.info("Extracting the span context from the context_carrier.")
-        parent_context = otel_task_tracer.extract(context_carrier)
-        with otel_task_tracer.start_child_span(
-            span_name="part1_with_parent_ctx",
-            parent_context=parent_context,
-            component="dag",
-        ) as p1_with_ctx_s:
-            p1_with_ctx_s.set_attribute("using_parent_ctx", "true")
-            # Some work.
-            logger.info("From part1_with_parent_ctx.")
-
-            with otel_task_tracer.start_child_span("sub_span_without_setting_parent") as sub1_s:
-                sub1_s.set_attribute("get_parent_ctx_from_curr", "true")
+    with task_root_span(ti, otel_task_tracer, tracer_provider) as parent_context:
+        if context_carrier is not None:
+            logger.info("Found ti.context_carrier: %s.", context_carrier)
+            logger.info("Extracting the span context from the context_carrier.")
+            with otel_task_tracer.start_child_span(
+                span_name="part1_with_parent_ctx",
+                parent_context=parent_context,
+                component="dag",
+            ) as p1_with_ctx_s:
+                p1_with_ctx_s.set_attribute("using_parent_ctx", "true")
                 # Some work.
-                logger.info("From sub_span_without_setting_parent.")
+                logger.info("From part1_with_parent_ctx.")
 
-                otel_tracer_provider = otel_task_tracer.get_otel_tracer_provider()
-
-                # To use library instrumentation we have to hook up the tracer_provider.
-                # The instrumentation library must already be installed.
-                instrument_requests(otel_tracer_provider)
-
-                # If we don't set the parent context, it will get it like so
-                # trace.get_current_span().get_span_context()
-                # and then start_as_current_span()
-                # tracer.start_as_current_span(name="")
-                with otel_task_tracer.start_child_span(span_name="get_repos_auto_instrumentation") as auto_instr_s:
-                    # Some remote request.
-                    response = requests.get("https://api.github.com/users/xBis7/repos")
-                    logger.info("Response: %s", response.json())
-
-                    auto_instr_s.set_attribute("test.repos_response", pformat(response.json()))
-
-                tracer = trace.get_tracer("trace_test.tracer", tracer_provider=tracer_provider)
-                with tracer.start_as_current_span(name="sub_span_start_as_current") as sub_curr_s:
-                    sub_curr_s.set_attribute("start_as_current", "true")
+                with otel_task_tracer.start_child_span("sub_span_without_setting_parent") as sub1_s:
+                    sub1_s.set_attribute("get_parent_ctx_from_curr", "true")
                     # Some work.
-                    logger.info("From sub_span_start_as_current.")
+                    logger.info("From sub_span_without_setting_parent.")
 
-        with otel_task_tracer.start_child_span(
-            span_name="part2_with_parent_ctx",
-            parent_context=parent_context,
-            component="dag",
-        ) as p2_with_ctx_s:
-            p1_with_ctx_s.set_attribute("using_parent_ctx", "true")
-            # Some work.
-            logger.info("From part2_with_parent_ctx.")
+                    otel_tracer_provider = otel_task_tracer.get_otel_tracer_provider()
+
+                    # To use library instrumentation we have to hook up the tracer_provider.
+                    # The instrumentation library must already be installed.
+                    instrument_requests(otel_tracer_provider)
+
+                    # If we don't set the parent context, it will get it like so
+                    # trace.get_current_span().get_span_context()
+                    # and then start_as_current_span()
+                    # tracer.start_as_current_span(name="")
+                    with otel_task_tracer.start_child_span(span_name="get_repos_auto_instrumentation") as auto_instr_s:
+                        # Some remote request.
+                        response = requests.get("https://api.github.com/users/xBis7/repos")
+                        logger.info("Response: %s", response.json())
+
+                        auto_instr_s.set_attribute("test.repos_response", pformat(response.json()))
+
+                    tracer = trace.get_tracer("trace_test.tracer", tracer_provider=tracer_provider)
+                    with tracer.start_as_current_span(name="sub_span_start_as_current") as sub_curr_s:
+                        sub_curr_s.set_attribute("start_as_current", "true")
+                        # Some work.
+                        logger.info("From sub_span_start_as_current.")
+
+            with otel_task_tracer.start_child_span(
+                span_name="part2_with_parent_ctx",
+                parent_context=parent_context,
+                component="dag",
+            ) as p2_with_ctx_s:
+                p2_with_ctx_s.set_attribute("using_parent_ctx", "true")
+                # Some work.
+                logger.info("From part2_with_parent_ctx.")
 
     logger.info("Task_1 finished.")
 
@@ -121,10 +142,11 @@ def task2(ti):
     otel_tracer_provider = otel_task_tracer.get_otel_tracer_provider()
     instrument_requests(otel_tracer_provider)
 
-    # Some remote request with the context injected into the headers.
-    res = requests.get("https://monitorama-demo-test.wallace.network/space_json/", headers=context_carrier, timeout=25)
+    with task_root_span(ti, otel_task_tracer, otel_tracer_provider):
+        # Some remote request with the context injected into the headers.
+        res = requests.get("https://monitorama-demo-test.wallace.network/space_json/", headers=context_carrier, timeout=25)
 
-    logger.info("\n\tStatus: " + str(res.status_code) + "\n\tBody: " + str(res.text))
+        logger.info("\n\tStatus: " + str(res.status_code) + "\n\tBody: " + str(res.text))
     
     logger.info("Task_2 finished.")
 
