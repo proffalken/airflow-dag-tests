@@ -24,6 +24,7 @@ from typing import Iterator
 import pendulum
 
 import requests
+import random
 
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from opentelemetry import trace
@@ -201,12 +202,41 @@ def task2(ti):
     logger.info("Task_2 finished")
     logger.info("=" * 80)
 
+@task
+def task3(ti):
+    logger.info("=" * 80)
+    logger.info(f"Starting Task_3 - DAG: {ti.dag_id}, Run: {ti.run_id}")
+
+    context_carrier = ti.context_carrier
+    
+    # DIAGNOSTIC
+    if context_carrier is None:
+        logger.error("❌ NO CONTEXT CARRIER in task2!")
+    else:
+        logger.info(f"✓ Context carrier: {context_carrier}")
+
+    otel_task_tracer = otel_tracer.get_otel_tracer_for_task(Trace)
+    otel_tracer_provider = otel_task_tracer.get_otel_tracer_provider()
+    instrument_requests(otel_tracer_provider)
+
+    with task_root_span(ti, otel_task_tracer, otel_tracer_provider):
+        rn = random.randrange(0, 256)
+        res = requests.get(
+            "https://3jqmloorwqgmwwdoabvtcxp5pu0mqftr.lambda-url.eu-west-2.on.aws/?name=Matt&x=1",
+            timeout=25
+        )
+        
+        logger.info(f"\n\tStatus: {res.status_code}\n\tBody: {res.text[:200]}")
+    
+    logger.info("Task_3 finished")
+    logger.info("=" * 80)
+
 @dag(
     schedule=timedelta(seconds=30),
     start_date=pendulum.datetime(2025, 8, 30, tz="UTC"),
     catchup=False,
 )
 def otel_test_dag():
-    chain(task1(), task2())
+    chain(task1(), task2(), task3())
 
 otel_test_dag()
