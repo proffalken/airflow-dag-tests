@@ -1,4 +1,3 @@
-import os
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -15,7 +14,7 @@ from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from opentelemetry import trace
 from opentelemetry.trace import SpanKind
 
-from airflow.sdk import chain, dag, task
+from airflow.sdk import chain, dag, task, Variable
 from airflow.traces import otel_tracer
 from airflow.traces.tracer import Trace
 
@@ -207,10 +206,10 @@ def task3(ti):
     instrument_requests(otel_tracer_provider)
 
     with task_root_span(ti, otel_task_tracer, otel_tracer_provider):
-        header = {"x-shared-secret": os.getenv("LAMBDA_SHARED_SECRET")}
+        header = {"x-shared-secret": Variable.get("LAMBDA_SHARED_SECRET")}
         rn = random.randrange(0, 256)
         res = requests.get(
-            "https://3jqmloorwqgmwwdoabvtcxp5pu0mqftr.lambda-url.eu-west-2.on.aws/?name=Matt&x=1",
+            f"https://3jqmloorwqgmwwdoabvtcxp5pu0mqftr.lambda-url.eu-west-2.on.aws/?name=Matt&x={rn}",
             timeout=25,
             headers=header
         )
