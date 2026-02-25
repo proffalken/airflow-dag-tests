@@ -7,3 +7,5 @@ def hello_world():
     print("Hello Everyone!")
 
   hwt()
+
+hello_world()
