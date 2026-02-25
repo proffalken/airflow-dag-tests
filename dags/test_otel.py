@@ -107,7 +107,7 @@ def task2(ti):
     logger.info("Injected headers: " + str(context_carrier))
 
     # Some remote request with the context injected into the headers.
-    res = requests.get("https://www.google.com/", headers=context_carrier, timeout=25)
+    res = requests.get("https://monitorama-demo-test.wallace.network/space_json/", headers=context_carrier, timeout=25)
 
     logger.info("\n\tStatus: " + str(res.status_code) + "\n\tBody: " + str(res.text))
     
