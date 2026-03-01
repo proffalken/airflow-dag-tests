@@ -18,6 +18,8 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 
+import os
+
 from airflow.sdk import chain, dag, task, Variable
 from airflow.traces import otel_tracer
 from airflow.traces.tracer import Trace
@@ -29,9 +31,16 @@ _REQUESTS_INSTRUMENTED = False
 
 
 def create_task_provider(task_id: str) -> TracerProvider:
+    # Use the airflow-otel-collector cluster service, not OTEL_EXPORTER_OTLP_ENDPOINT
+    # which is set by Dash0's injector to a node-local address unreachable within the pod network.
+    host = os.environ["AIRFLOW_OTEL_COLLECTOR_SERVICE_HOST"]
+    port = os.environ["AIRFLOW_OTEL_COLLECTOR_SERVICE_PORT_OTLP_HTTP"]
+    endpoint = f"http://{host}:{port}/v1/traces"
+    logger.info(f"Creating task provider for '{task_id}' exporting to {endpoint}")
+
     resource = Resource.create({SERVICE_NAME: task_id})
     provider = TracerProvider(resource=resource)
-    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter()))
+    provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
     return provider
 
 
