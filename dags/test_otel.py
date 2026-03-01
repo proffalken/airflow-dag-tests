@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import timedelta
 import logging
+import os
 from typing import Iterator
 
 import pendulum
@@ -12,13 +13,12 @@ import random
 
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
 from opentelemetry import trace
+from opentelemetry.propagate import inject, extract as otel_extract
 from opentelemetry.trace import SpanKind
 from opentelemetry.sdk.resources import Resource, SERVICE_NAME
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-
-import os
 
 from airflow.sdk import chain, dag, task, Variable
 from airflow.traces import otel_tracer
@@ -31,13 +31,10 @@ _REQUESTS_INSTRUMENTED = False
 
 
 def create_task_provider(task_id: str) -> TracerProvider:
-    # Use the airflow-otel-collector cluster service, not OTEL_EXPORTER_OTLP_ENDPOINT
-    # which is set by Dash0's injector to a node-local address unreachable within the pod network.
     host = os.environ["AIRFLOW_OTEL_COLLECTOR_SERVICE_HOST"]
     port = os.environ["AIRFLOW_OTEL_COLLECTOR_SERVICE_PORT_OTLP_HTTP"]
     endpoint = f"http://{host}:{port}/v1/traces"
     logger.info(f"Creating task provider for '{task_id}' exporting to {endpoint}")
-
     resource = Resource.create({SERVICE_NAME: task_id})
     provider = TracerProvider(resource=resource)
     provider.add_span_processor(BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint)))
@@ -52,67 +49,75 @@ def instrument_requests(task_provider):
     _REQUESTS_INSTRUMENTED = True
 
 
-@contextmanager
-def task_root_span(ti, otel_task_tracer, task_provider) -> Iterator:
-    parent_context = None
+def resolve_parent_context(ti, otel_task_tracer, previous_task_id=None):
+    """Resolve parent context from previous task's XCom handoff, or Airflow's carrier."""
+    if previous_task_id:
+        carrier = ti.xcom_pull(task_ids=previous_task_id, key="otel_context")
+        if carrier:
+            logger.info(f"✓ Using handoff context from {previous_task_id}: {carrier}")
+            return otel_extract(carrier)
+        logger.warning(f"⚠ No XCom handoff from {previous_task_id}, falling back to Airflow carrier")
 
-    # DIAGNOSTIC: Check if Airflow provided trace context
     if ti.context_carrier is not None:
-        logger.info(f"✓ Found context_carrier: {ti.context_carrier}")
-        parent_context = otel_task_tracer.extract(ti.context_carrier)
-    else:
-        logger.error("❌ ti.context_carrier is None! DAG run did not create root span.")
-        logger.error("Check Airflow [traces] configuration: otel_on, otel_dag_run_log_event")
+        logger.info(f"✓ Using Airflow context carrier: {ti.context_carrier}")
+        return otel_task_tracer.extract(ti.context_carrier)
 
+    logger.error("❌ No parent context available")
+    return None
+
+
+@contextmanager
+def task_root_span(ti, task_provider, parent_context) -> Iterator:
     tracer = trace.get_tracer(ti.task_id, tracer_provider=task_provider)
 
     with tracer.start_as_current_span(
         f"dag.{ti.dag_id}.task.{ti.task_id}",
         context=parent_context,
-        kind=SpanKind.INTERNAL,
+        kind=SpanKind.CONSUMER,
     ) as span:
         span.set_attribute("airflow.dag_id", ti.dag_id)
         span.set_attribute("airflow.task_id", ti.task_id)
         span.set_attribute("airflow.run_id", ti.run_id)
 
-        # DIAGNOSTIC: Verify trace ID was created
         span_context = span.get_span_context()
         if span_context.trace_id == 0:
             logger.error("❌ CRITICAL: Span has trace_id = 0! OpenTelemetry not initialized!")
         else:
-            trace_id = format(span_context.trace_id, '032x')
-            span_id = format(span_context.span_id, '016x')
-            logger.info(f"✓ Trace ID: {trace_id}")
-            logger.info(f"✓ Span ID: {span_id}")
+            logger.info(f"✓ Trace ID: {format(span_context.trace_id, '032x')}")
+            logger.info(f"✓ Span ID: {format(span_context.span_id, '016x')}")
 
-        yield parent_context
+        yield span
+
+        # After task work completes, emit a PRODUCER handoff span as a child of
+        # this CONSUMER span. The next task uses it as its parent, which is what
+        # creates the directed edge in the service map.
+        with tracer.start_as_current_span(
+            f"task.{ti.task_id}.trigger_next",
+            kind=SpanKind.PRODUCER,
+        ):
+            carrier = {}
+            inject(carrier)
+            ti.xcom_push(key="otel_context", value=carrier)
+            logger.info(f"✓ Handoff context pushed to XCom: {carrier}")
+
 
 @task
 def task1(ti):
     logger.info("=" * 80)
     logger.info(f"Starting Task_1 - DAG: {ti.dag_id}, Run: {ti.run_id}")
 
-    context_carrier = ti.context_carrier
-
-    # CRITICAL DIAGNOSTIC
-    if context_carrier is None:
-        logger.error("❌ NO CONTEXT CARRIER - DAG tracing is broken!")
-    else:
-        logger.info(f"✓ Context carrier present: {context_carrier}")
-
     otel_task_tracer = otel_tracer.get_otel_tracer_for_task(Trace)
     task_provider = create_task_provider(ti.task_id)
+    parent_context = resolve_parent_context(ti, otel_task_tracer)
 
-    with task_root_span(ti, otel_task_tracer, task_provider) as parent_context:
-        # Verify current span
+    with task_root_span(ti, task_provider, parent_context) as span:
         current_span = trace.get_current_span()
         ctx = current_span.get_span_context()
-
         if ctx.trace_id != 0:
             logger.info(f"✓ Active trace: {format(ctx.trace_id, '032x')}")
 
-        if context_carrier is not None:
-            logger.info("Found ti.context_carrier: %s.", context_carrier)
+        if ti.context_carrier is not None:
+            logger.info("Found ti.context_carrier: %s.", ti.context_carrier)
             logger.info("Extracting the span context from the context_carrier.")
             with otel_task_tracer.start_child_span(
                 span_name="part1_with_parent_ctx",
@@ -129,7 +134,7 @@ def task1(ti):
                     instrument_requests(task_provider)
 
                     with otel_task_tracer.start_child_span(span_name="get_repos_auto_instrumentation") as auto_instr_s:
-                        todo = random.randrange(0,199)
+                        todo = random.randrange(0, 199)
                         response = requests.get(f"https://jsonplaceholder.typicode.com/todos/{todo}")
                         logger.info("Response: %s", response.json())
                         auto_instr_s.set_attribute("test.repos_response", pformat(response.json()))
@@ -156,19 +161,12 @@ def task2(ti):
     logger.info("=" * 80)
     logger.info(f"Starting Task_2 - DAG: {ti.dag_id}, Run: {ti.run_id}")
 
-    context_carrier = ti.context_carrier
-
-    # DIAGNOSTIC
-    if context_carrier is None:
-        logger.error("❌ NO CONTEXT CARRIER in task2!")
-    else:
-        logger.info(f"✓ Context carrier: {context_carrier}")
-
     otel_task_tracer = otel_tracer.get_otel_tracer_for_task(Trace)
     task_provider = create_task_provider(ti.task_id)
     instrument_requests(task_provider)
+    parent_context = resolve_parent_context(ti, otel_task_tracer, previous_task_id="task1")
 
-    with task_root_span(ti, otel_task_tracer, task_provider):
+    with task_root_span(ti, task_provider, parent_context):
         res = requests.get(
             "https://monitorama-demo-test.wallace.network/space_json/",
             timeout=25
@@ -179,24 +177,18 @@ def task2(ti):
     logger.info("Task_2 finished")
     logger.info("=" * 80)
 
+
 @task
 def task3(ti):
     logger.info("=" * 80)
     logger.info(f"Starting Task_3 - DAG: {ti.dag_id}, Run: {ti.run_id}")
 
-    context_carrier = ti.context_carrier
-
-    # DIAGNOSTIC
-    if context_carrier is None:
-        logger.error("❌ NO CONTEXT CARRIER in task3!")
-    else:
-        logger.info(f"✓ Context carrier: {context_carrier}")
-
     otel_task_tracer = otel_tracer.get_otel_tracer_for_task(Trace)
     task_provider = create_task_provider(ti.task_id)
     instrument_requests(task_provider)
+    parent_context = resolve_parent_context(ti, otel_task_tracer, previous_task_id="task2")
 
-    with task_root_span(ti, otel_task_tracer, task_provider):
+    with task_root_span(ti, task_provider, parent_context):
         header = {"x-shared-secret": Variable.get("LAMBDA_SHARED_SECRET")}
         rn = random.randrange(0, 256)
         res = requests.get(
@@ -210,6 +202,7 @@ def task3(ti):
     logger.info("Task_3 finished")
     logger.info("=" * 80)
 
+
 @dag(
     schedule=timedelta(seconds=30),
     start_date=pendulum.datetime(2025, 8, 30, tz="UTC"),
@@ -217,5 +210,6 @@ def task3(ti):
 )
 def otel_test_dag():
     chain(task1(), task2(), task3())
+
 
 otel_test_dag()
