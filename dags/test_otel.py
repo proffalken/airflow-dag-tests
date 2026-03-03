@@ -204,7 +204,7 @@ def task3(ti):
 
 
 @dag(
-    schedule=timedelta(seconds=30),
+   # schedule=timedelta(seconds=30),
     start_date=pendulum.datetime(2025, 8, 30, tz="UTC"),
     catchup=False,
 )
